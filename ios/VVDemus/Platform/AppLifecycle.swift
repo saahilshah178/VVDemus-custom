@@ -19,11 +19,11 @@ enum AppLifecycle {
         #if os(iOS)
         // `willTerminate` as well: it is what an app still running in the background gets
         // when it is swiped away, which is exactly the state this one is in while playing.
-        [UIApplication.didEnterBackgroundNotification, UIApplication.willTerminateNotification]
+        return [UIApplication.didEnterBackgroundNotification, UIApplication.willTerminateNotification]
         #elseif os(macOS)
-        [NSApplication.willTerminateNotification]
+        return [NSApplication.willTerminateNotification]
         #else
-        []
+        return []
         #endif
     }
 }
