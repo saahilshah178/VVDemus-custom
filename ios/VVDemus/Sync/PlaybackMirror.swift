@@ -102,11 +102,33 @@ struct FirstMeeting {
     var peerIsDesktop: Bool
     var localPeerId: String
     var peerPeerId: String
+    /// When each device's session was saved, if it is one that was only read back off disk at
+    /// launch and nobody has touched since; nil for a session that has been used in this run of
+    /// the app. See `PlayerService.restoredSessionSavedAt`.
+    ///
+    /// Defaulted to nil — "in use" — which is what every session was before sessions were
+    /// saved, and what a peer on a build from before then reports by leaving the field out.
+    var localRestoredAt: Date? = nil
+    var peerRestoredAt: Date? = nil
 
     var localKeepsSession: Bool {
         // The device actually making sound wins. Interrupting it to resume something that was
         // paused is the one outcome nobody wants.
         if localIsPlaying != peerIsPlaying { return localIsPlaying }
+        // A session somebody is using beats one that merely came back off disk when its app
+        // was opened. Before sessions were saved a freshly opened app held nothing, so it could
+        // never take the session from the other device; this keeps that true. Without it, the
+        // desktop rule below hands last night's queue on the Mac the session a phone was
+        // listened to all the way home, the moment the Mac app is opened.
+        //
+        // Before the desktop rule and after the playing one: a restored session is never
+        // playing — pressing play is using it — so the first clause never has to weigh one.
+        if (localRestoredAt == nil) != (peerRestoredAt == nil) { return localRestoredAt == nil }
+        // Both only came back off disk — both apps were opened since anything was played. The
+        // one saved later is the one that was listened to last.
+        if let localRestoredAt, let peerRestoredAt, localRestoredAt != peerRestoredAt {
+            return localRestoredAt > peerRestoredAt
+        }
         // Both playing, or both paused: the desktop takes it. It is the device you are sat in
         // front of, and the one whose session you can see.
         if localIsDesktop != peerIsDesktop { return localIsDesktop }

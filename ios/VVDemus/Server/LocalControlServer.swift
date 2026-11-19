@@ -1319,7 +1319,8 @@ final class LocalControlServer: ObservableObject {
             librarySignature: Self.librarySignature(),
             sessionOwnerId: SessionOwnership.shared.current.ownerPeerId,
             sessionClaim: SessionOwnership.shared.current.claim,
-            contextSeed: player.currentContextSeed
+            contextSeed: player.currentContextSeed,
+            restoredSessionSavedAt: player.restoredSessionSavedAt
         )
     }
 

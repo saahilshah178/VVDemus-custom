@@ -560,6 +560,44 @@ final class NoSessionOwner: SessionOwning {
     func claimSession() {}
 }
 
+// MARK: - The session, between launches
+
+/// Where `PlayerService` writes the session down so it is still there after the app has gone.
+///
+/// A seam for the same reason everything else in this file is one: what matters is *what* is
+/// saved, and when — that a pause writes the exact position, that handing the session to the
+/// paired device forgets it here, that a relaunch comes back paused where it stopped — and
+/// none of that should need a disk, or leave a file behind in the app's real container.
+///
+/// The live implementation is `PlaybackSessionFileStore`.
+@MainActor
+protocol PlaybackSessionPersisting: AnyObject {
+    /// The session as last saved, at the newest position saved for it. Nil when there is
+    /// nothing to come back to.
+    func load() -> SavedSession?
+    func save(_ session: SavedSession)
+    /// Just how far the current track has got, which changes far more often than anything
+    /// else about the session — see `SavedPosition`.
+    func savePosition(_ position: SavedPosition)
+    func clear()
+    /// Returns once everything handed over so far is safely stored, for the moments after
+    /// which the process may not get to run again.
+    func flush()
+}
+
+/// Remembers nothing — what every test gets unless it asks for otherwise, for the same reason
+/// `NoSessionOwner` is the default: a `PlayerService` built for a test must neither start out
+/// holding somebody's real queue nor write its fixtures over one.
+@MainActor
+final class NoSessionPersistence: PlaybackSessionPersisting {
+    static let shared = NoSessionPersistence()
+    func load() -> SavedSession? { nil }
+    func save(_ session: SavedSession) {}
+    func savePosition(_ position: SavedPosition) {}
+    func clear() {}
+    func flush() {}
+}
+
 // MARK: - History / stats side effects
 
 /// The library bookkeeping `PlayerService` triggers as a side effect of playing things.

@@ -294,7 +294,9 @@ final class PeerPlayback: ObservableObject, SessionOwning {
             localIsDesktop: localIsDesktop,
             peerIsDesktop: peer.isDesktop,
             localPeerId: SessionOwnership.shared.localPeerId,
-            peerPeerId: peer.peerId
+            peerPeerId: peer.peerId,
+            localRestoredAt: PlayerService.shared.restoredSessionSavedAt,
+            peerRestoredAt: state.restoredSessionSavedAt
         )
 
         PairLog.info("first meeting with \(peer.name): local playing=\(meeting.localIsPlaying) desktop=\(localIsDesktop), peer playing=\(state.isPlaying) — \(meeting.localKeepsSession ? "keeping the session here" : "yielding to the peer")")

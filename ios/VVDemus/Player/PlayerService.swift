@@ -6,19 +6,27 @@ import MediaPlayer
 final class PlayerService: ObservableObject {
     static let shared = PlayerService()
 
-    @Published private(set) var currentTrack: Track?
+    // The `didSet`s on this property and on the queue state below are how the session gets
+    // written down — see "Remembering the session between launches". Observers rather than a
+    // call at each of the twenty-odd places a queue is edited, so the next one added cannot
+    // forget.
+    @Published private(set) var currentTrack: Track? { didSet { sessionDidChange() } }
     /// Explicitly user-queued tracks ("Play Next" / "Add to Queue"), FIFO — these always
     /// play before the rest of the current context, regardless of shuffle.
-    @Published private(set) var manualQueue: [Track] = []
+    @Published private(set) var manualQueue: [Track] = [] { didSet { sessionDidChange() } }
     /// The rest of the playlist/radio/search results that were playing when playback
     /// started (or that autoplay fetched next). Reorders when shuffle is toggled.
-    @Published private(set) var contextQueue: [Track] = []
-    @Published private(set) var isShuffling = false
-    @Published private(set) var isPlaying = false
+    @Published private(set) var contextQueue: [Track] = [] { didSet { sessionDidChange() } }
+    @Published private(set) var isShuffling = false { didSet { sessionDidChange() } }
+    @Published private(set) var isPlaying = false {
+        // Stopping is the moment the position stops moving, so it is the moment to write
+        // down exactly where — not wherever the last five-second mark happened to fall.
+        didSet { if oldValue, !isPlaying { savePositionIfMoved() } }
+    }
     @Published private(set) var isLoading = false
-    @Published private(set) var progress: Double = 0
+    @Published private(set) var progress: Double = 0 { didSet { positionDidChange() } }
     @Published private(set) var duration: Double = 0
-    @Published private(set) var queueContextTitle: String?
+    @Published private(set) var queueContextTitle: String? { didSet { sessionDidChange() } }
     @Published var errorMessage: String?
     /// Which device is actually producing sound. Switching only ever pauses this phone's
     /// AVPlayer or reattaches it — all queue/radio/stats logic above stays exactly the
@@ -80,6 +88,9 @@ final class PlayerService: ObservableObject {
     private func bumpPlaybackEpoch() {
         playbackEpoch &+= 1
         lastPlaybackChangeAt = Date()
+        // Someone has pressed something, so this is no longer a session that merely came
+        // back off disk — see `restoredSessionSavedAt`.
+        restoredSessionSavedAt = nil
     }
 
     /// When playback last changed here. Carried in the handoff checkpoint so the "continue
@@ -142,23 +153,23 @@ final class PlayerService: ObservableObject {
 
     /// contextQueue in its real (unshuffled) order — the source of truth restored when
     /// shuffle is turned off, and reshuffled fresh each time it's turned back on.
-    private var orderedContextQueue: [Track] = []
+    private var orderedContextQueue: [Track] = [] { didSet { sessionDidChange() } }
     /// The track the current context was generated from, when it is a radio. Carried in the
     /// handoff checkpoint — and in the state snapshot — so the station survives moving between
     /// devices, and so a mirror can take it over if the device playing it disappears.
-    private(set) var currentContextSeed: Track?
+    private(set) var currentContextSeed: Track? { didSet { sessionDidChange() } }
 
     /// Which of the two queues a track was taken from. Needed so `previous()` can put the
     /// track it's leaving back where it came from: it used to push everything onto
     /// `contextQueue`, so stepping back over a track the user had explicitly queued
     /// quietly demoted it out of the manual queue, and the next `advance()` played
     /// whatever else was in the manual queue instead of retracing the path.
-    enum QueueOrigin: String, Equatable {
+    enum QueueOrigin: String, Equatable, Codable {
         case manual
         case context
     }
 
-    private var currentTrackOrigin: QueueOrigin = .context
+    private var currentTrackOrigin: QueueOrigin = .context { didSet { sessionDidChange() } }
     /// Where the current track sat in `orderedContextQueue` — the *unshuffled* running
     /// order — at the moment it was taken off the queue. Meaningless while the origin is
     /// `.manual`.
@@ -168,8 +179,10 @@ final class PlayerService: ObservableObject {
     /// nothing about where a track belongs in the real one; the position has to be recorded
     /// when it is consumed. It goes stale if the queue is edited in between, so it is
     /// clamped on use rather than trusted.
-    private var currentTrackOrderedIndex = 0
-    private var backStack: [(track: Track, origin: QueueOrigin, orderedIndex: Int)] = []
+    private var currentTrackOrderedIndex = 0 { didSet { sessionDidChange() } }
+    private var backStack: [(track: Track, origin: QueueOrigin, orderedIndex: Int)] = [] {
+        didSet { sessionDidChange() }
+    }
     private let recentRadioAvoidCount = 12
     private let backStackLimit = 30
 
@@ -187,6 +200,7 @@ final class PlayerService: ObservableObject {
     private let sessionOwner: SessionOwning
     private let mirror: MirroredNowPlayingSource
     private let defaults: UserDefaults
+    private let sessionStore: PlaybackSessionPersisting
 
     /// Offers an intent to the device that owns the session, and reports whether it went there.
     ///
@@ -278,7 +292,8 @@ final class PlayerService: ObservableObject {
             radios: APIRadioFetcher.shared,
             notifications: .default,
             sessionOwner: PeerPlayback.shared,
-            mirror: PeerMirroredNowPlaying.shared
+            mirror: PeerMirroredNowPlaying.shared,
+            sessionStore: PlaybackSessionFileStore.shared
         )
     }
 
@@ -301,7 +316,11 @@ final class PlayerService: ObservableObject {
         /// Injectable so a test's volume levels don't land in — or read out of — the real
         /// app's defaults. Everything else `PlayerService` persists already goes through a
         /// store it can be handed a fake of; two scalars didn't warrant a whole store.
-        defaults: UserDefaults = .standard
+        defaults: UserDefaults = .standard,
+        /// Where the session is kept between launches. Defaulted to the one that keeps
+        /// nothing, so a test starts with an empty player and leaves no file behind — see
+        /// `NoSessionPersistence`.
+        sessionStore: PlaybackSessionPersisting = NoSessionPersistence.shared
     ) {
         self.engine = engine
         self.session = session
@@ -315,12 +334,16 @@ final class PlayerService: ObservableObject {
         self.sessionOwner = sessionOwner
         self.mirror = mirror
         self.defaults = defaults
+        self.sessionStore = sessionStore
 
         loadVolumes()
         configureEngineCallbacks()
         configureMirrorCallback()
         configureRemoteCommandCenter()
         observeAudioSession()
+        // Last, once everything it publishes through is wired up.
+        restoreSavedSession()
+        observeLastChancesToSave()
     }
 
     /// The mirror's poll is the only thing that ticks on a device that owns nothing.
@@ -350,6 +373,11 @@ final class PlayerService: ObservableObject {
             // its position and duration were written into the incoming track's fields.
             guard self.activeDevice == .iphone, !self.isResumingAfterDeviceSwitch,
                   !self.isLoading else { return }
+            // Nothing of this track has reached the engine — a session just read back off
+            // disk, or a load that failed — so whatever the engine is reporting, it is not
+            // this track's position. For a restored session it would be zero, written over
+            // the very position that was restored.
+            guard self.attachedURL != nil else { return }
             guard seconds.isFinite else { return }
             // Before `progress` is written: if this returns true the track is over and a new
             // one is loading, and the position belongs to an item that is on its way out.
@@ -962,12 +990,12 @@ final class PlayerService: ObservableObject {
         isShuffling = checkpoint.isShuffling
         queueContextTitle = checkpoint.queueContextTitle
 
-        load(track, autoplay: autoplay)
-        // *After* `load`, deliberately. `beginLoad` resets `progress` to 0, and the load task
-        // reads `progress` when it finally attaches the item — which happens after this returns,
-        // since resolving the stream URL is asynchronous. Setting it here is therefore what the
-        // attach picks up as its resume point; setting it before would be wiped.
-        progress = max(0, checkpoint.progress)
+        // Handed to the load rather than written to `progress` once it returns, which is what
+        // this used to do. That reached the player only when the attach happened later, after a
+        // stream had been resolved; a track this device has downloaded is attached before
+        // `load` returns, so it started from the top under a scrubber showing the handed-over
+        // position, and the first tick dragged the scrubber back to match.
+        load(track, autoplay: autoplay, startAt: max(0, checkpoint.progress))
     }
 
     /// Gives the session up entirely, because the paired device has taken it over.
@@ -1038,6 +1066,181 @@ final class PlayerService: ObservableObject {
         // Falls back to `clear()` on its own when there is no mirrored session either, which is
         // every case that isn't a handoff.
         updateNowPlayingInfo()
+    }
+
+    // MARK: - Remembering the session between launches
+
+    /// When the session this device is holding was saved, for as long as it is one that was
+    /// read back off disk at launch and nobody has touched since. Nil for a session that has
+    /// been used in this run of the app, and nil when there is no session at all.
+    ///
+    /// It exists for the paired device's benefit. Until sessions were saved, an app that had
+    /// just been opened was always empty, so it mirrored whatever the other device was holding
+    /// and never competed with it. A restored session must not change that: last night's queue
+    /// coming back on the Mac is not a reason to take the session from the phone that was
+    /// listened to on the way home. So it travels in the state snapshot and `FirstMeeting`
+    /// ranks a session someone is actually using above one that only came back from disk.
+    ///
+    /// Whole seconds, because that is all the peer wire carries (its dates are ISO 8601) and
+    /// both devices have to be comparing the same two numbers.
+    private(set) var restoredSessionSavedAt: Date?
+
+    /// True while `restoreSavedSession` is writing the saved state back, which would
+    /// otherwise look like a burst of edits and be saved straight back to where it came from.
+    private var isRestoringSession = false
+    private var pendingSessionSave: Task<Void, Never>?
+    /// The position `sessionStore` was last given, so the tick can tell whether playback has
+    /// moved far enough from it to be worth another write.
+    private var lastWrittenPosition: (videoId: String, position: Double)?
+
+    /// How long a change waits before it is written, so that a burst of them — skipping
+    /// through five tracks, dragging a row down the queue — is one write of the queue as it
+    /// ended up rather than five of everything in between.
+    ///
+    /// Settable for the same reason `stallGrace` is: a test that wants to see the delayed
+    /// save happen should not have to wait out the real delay to see it.
+    static var sessionSaveDelay: TimeInterval = 0.5
+
+    /// Puts back the session this device was holding when the app last went away.
+    ///
+    /// Paused, at the position it stopped at, and with nothing attached to the engine: no
+    /// stream is resolved, the audio session is not touched and nothing is recorded as played.
+    /// Opening the app is not a request for any of that — the first press of play is, and
+    /// `setPlayback` already knows what to do with a track that has nothing attached.
+    ///
+    /// Restored whatever the ownership record says. If the paired device has taken the session
+    /// since, its first poll makes this device a mirror and `releaseSession` lets this copy go,
+    /// exactly as it would for a session that had been sitting here in memory the whole time.
+    private func restoreSavedSession() {
+        guard let saved = sessionStore.load() else { return }
+        isRestoringSession = true
+        defer { isRestoringSession = false }
+        let position = saved.resumePosition
+        currentTrack = saved.currentTrack
+        manualQueue = saved.manualQueue
+        orderedContextQueue = saved.orderedContextQueue
+        contextQueue = saved.contextQueue
+        isShuffling = saved.isShuffling
+        queueContextTitle = saved.queueContextTitle
+        currentContextSeed = saved.contextSeed
+        currentTrackOrigin = saved.currentTrackOrigin
+        currentTrackOrderedIndex = saved.currentTrackOrderedIndex
+        backStack = saved.history.suffix(backStackLimit).map {
+            (track: $0.track, origin: $0.origin, orderedIndex: $0.orderedIndex)
+        }
+        progress = position
+        duration = saved.resumeDuration
+        // When playback last changed is when this was saved, not now. The "continue from…"
+        // offer compares this against the paired device's, and a queue from last night must
+        // not present itself as the more recent of the two because the app was just opened.
+        lastPlaybackChangeAt = saved.savedAt
+        restoredSessionSavedAt = Date(timeIntervalSince1970: saved.savedAt.timeIntervalSince1970.rounded(.down))
+        lastWrittenPosition = (saved.currentTrack.videoId, position)
+        updateNowPlayingInfo()
+    }
+
+    /// Something about which tracks are queued, or which one is playing, has changed.
+    private func sessionDidChange() {
+        guard !isRestoringSession else { return }
+        // A queue that has been edited is a queue someone is using.
+        restoredSessionSavedAt = nil
+        guard pendingSessionSave == nil else { return }
+        pendingSessionSave = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, Self.sessionSaveDelay) * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            self.pendingSessionSave = nil
+            self.saveSession()
+        }
+    }
+
+    private func saveSession() {
+        pendingSessionSave?.cancel()
+        pendingSessionSave = nil
+        guard let track = currentTrack else {
+            // Nothing is held here any more — the queue was handed to the paired device, or
+            // it took the session over. Left on disk, the next launch would bring back a
+            // session that now lives somewhere else.
+            lastWrittenPosition = nil
+            sessionStore.clear()
+            return
+        }
+        lastWrittenPosition = (track.videoId, progress)
+        sessionStore.save(
+            SavedSession(
+                savedAt: Date(),
+                currentTrack: track,
+                position: progress,
+                duration: duration,
+                manualQueue: manualQueue,
+                contextQueue: contextQueue,
+                orderedContextQueue: orderedContextQueue,
+                isShuffling: isShuffling,
+                queueContextTitle: queueContextTitle,
+                contextSeed: currentContextSeed,
+                currentTrackOrigin: currentTrackOrigin,
+                currentTrackOrderedIndex: currentTrackOrderedIndex,
+                history: backStack.map {
+                    SavedSession.Played(track: $0.track, origin: $0.origin, orderedIndex: $0.orderedIndex)
+                }
+            )
+        )
+    }
+
+    /// `progress` has been written. Almost always that is the periodic tick, twice a second,
+    /// and almost always this does nothing.
+    private func positionDidChange() {
+        guard !isRestoringSession, let track = currentTrack else { return }
+        guard SavedPosition.isWorthWriting(
+            progress, videoId: track.videoId, lastWritten: lastWrittenPosition
+        ) else { return }
+        savePosition(of: track)
+    }
+
+    /// Writes the position down exactly, unless it is already there.
+    private func savePositionIfMoved() {
+        guard !isRestoringSession, let track = currentTrack else { return }
+        if let lastWrittenPosition, lastWrittenPosition.videoId == track.videoId,
+           lastWrittenPosition.position == progress { return }
+        savePosition(of: track)
+    }
+
+    private func savePosition(of track: Track) {
+        lastWrittenPosition = (track.videoId, progress)
+        sessionStore.savePosition(
+            SavedPosition(videoId: track.videoId, position: progress, duration: duration, savedAt: Date())
+        )
+    }
+
+    /// Writes down anything not yet written, and does not return until it is stored.
+    ///
+    /// For the moments after which this process may not run again. The delayed save and the
+    /// five-second position marks are both fine while the app is alive and both wrong at the
+    /// instant it stops being: a track skipped to just before quitting, or the last few seconds
+    /// of listening, would come back as they were a moment earlier.
+    func saveSessionNow() {
+        if pendingSessionSave != nil {
+            saveSession()
+        } else {
+            savePositionIfMoved()
+        }
+        sessionStore.flush()
+    }
+
+    private func observeLastChancesToSave() {
+        for name in AppLifecycle.lastChancesToSave {
+            // `queue: nil`, so the block runs inside the post rather than being queued behind
+            // it. On the way out of the process there may be no "later" for it to run in.
+            notifications.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                // The system posts these on the main thread, but nothing in the type system
+                // says so and `assumeIsolated` is a hard stop when it is wrong — the same
+                // reasoning as `SystemRemoteCommandCenter.setHandler`.
+                if Thread.isMainThread {
+                    MainActor.assumeIsolated { self?.saveSessionNow() }
+                } else {
+                    Task { @MainActor in self?.saveSessionNow() }
+                }
+            }
+        }
     }
 
     // MARK: - Shuffle
@@ -1279,20 +1482,24 @@ final class PlayerService: ObservableObject {
             updateNowPlayingInfo()
             return
         }
-        // Nothing of this track ever reached the engine: its load failed, after `beginLoad` had
-        // already cleared `attachedURL`. What the engine still holds is the *previous* track's
-        // item, paused wherever that one stopped — so `engine.play()` below resumed the wrong
-        // song under this one's title or, with that song already over, played nothing while
-        // `isPlaying` said otherwise. The error on screen says "try again"; this is the press
-        // that has to mean it.
+        // Nothing of this track ever reached the engine. Either its load failed, after
+        // `beginLoad` had already cleared `attachedURL`, or it is a session read back off disk
+        // at launch, which attaches nothing until it is asked to play.
+        //
+        // In the first case what the engine still holds is the *previous* track's item, paused
+        // wherever that one stopped — so `engine.play()` below resumed the wrong song under
+        // this one's title or, with that song already over, played nothing while `isPlaying`
+        // said otherwise. The error on screen says "try again"; this is the press that has to
+        // mean it. In the second the engine holds nothing at all, and this is the press that
+        // picks the session up where it was left.
         if shouldPlay, attachedURL == nil, !isLoading, let track = currentTrack {
-            // Carried across the reload the way `adopt` does it, since a scrub made since the
-            // failure is a position the user chose. Zeroed first because none of it was heard,
-            // and `beginLoad` would otherwise credit it to the listening stats.
+            // Carried across the reload, since it is either where the session was saved or a
+            // scrub made since — a position the user chose both ways. Zeroed first because none
+            // of it was heard in this run, and `beginLoad` would otherwise credit it to the
+            // listening stats.
             let resumeAt = progress
             progress = 0
-            beginLoad(track)
-            progress = resumeAt
+            beginLoad(track, startAt: resumeAt)
             return
         }
         // Bumped on the phone's own play/pause too, not just while casting. The epoch is
@@ -1771,11 +1978,11 @@ final class PlayerService: ObservableObject {
     /// context from the top — `play(track:context:)` queues everything *after* the track, and
     /// autoplay queues everything after `fresh.first`.
     private func load(_ track: Track, origin: QueueOrigin = .context, orderedIndex: Int = 0,
-                      autoplay: Bool = true) {
+                      autoplay: Bool = true, startAt: Double = 0) {
         pushOntoBackStack()
         currentTrackOrigin = origin
         currentTrackOrderedIndex = orderedIndex
-        beginLoad(track, autoplay: autoplay)
+        beginLoad(track, autoplay: autoplay, startAt: startAt)
     }
 
     private func pushOntoBackStack() {
@@ -1786,7 +1993,12 @@ final class PlayerService: ObservableObject {
         }
     }
 
-    private func beginLoad(_ track: Track, autoplay: Bool = true) {
+    /// `startAt` is for a track being picked up partway through — one handed over by the paired
+    /// device, or resumed from a saved session — and is the top of the track for everything
+    /// else. It is a parameter, rather than something the caller writes to `progress`
+    /// afterwards, because two of the three ways a track gets attached below happen before
+    /// this returns.
+    private func beginLoad(_ track: Track, autoplay: Bool = true, startAt: Double = 0) {
         loadTask?.cancel()
         // Starting a track is a request to play it — true whenever a person started it, which
         // is every caller but one. `continueAutoplay` is the exception: seconds of radio fetch
@@ -1814,7 +2026,7 @@ final class PlayerService: ObservableObject {
         currentTrack = track
         isLoading = true
         errorMessage = nil
-        progress = 0
+        progress = startAt
         // Seeded from the track's own metadata rather than left at zero until the first
         // periodic tick. Without it, handing playback back from the computer *while
         // paused* never ticks at all, so the scrubber was a one-second stub showing 0:00
@@ -1838,7 +2050,7 @@ final class PlayerService: ObservableObject {
         // before the prefetch below, which is why that branch can never hand AVPlayer the
         // browser-facing `/api/audio/local` path a downloaded track prefetches to.
         if let localURL = downloads.localFileURL(for: track) {
-            attach(url: localURL, track: track)
+            attach(url: localURL, track: track, resumeAt: progress)
             // Still worth doing: this track needed no network, but the one after it may.
             prefetchUpNext()
             return
@@ -1866,8 +2078,9 @@ final class PlayerService: ObservableObject {
                 // seconds on a cold cache, and the scrubber is live throughout — a drag
                 // during that window already moved `progress`, and attaching at zero threw
                 // it away, so the scrubber visibly sprang back to 0:00 the instant the
-                // track started. `beginLoad` zeroes `progress` before this task runs, so
-                // with no scrub this is still an ordinary start from the top.
+                // track started. `beginLoad` sets `progress` to where the track should
+                // start before this task runs — zero, unless it is being picked up partway
+                // through — so with no scrub this is still an ordinary start.
                 self.attach(url: url, track: track, resumeAt: self.progress)
                 // Only once this track is attached and playing. Started any earlier, the
                 // speculative request for the *next* track competes for bandwidth with the

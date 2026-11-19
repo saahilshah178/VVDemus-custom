@@ -88,6 +88,14 @@ struct StateSnapshot: Codable {
     /// has nothing to continue from. One track object, and it is kept even in a trimmed broadcast
     /// for the same reason `nextTrack` is: it is small, and it is the lifeline.
     let contextSeed: Track?
+    /// When this device's session was saved, if it is one that was read back off disk at launch
+    /// and has not been touched since — see `PlayerService.restoredSessionSavedAt`. Nil for a
+    /// session somebody is using, which is every session an older build can have.
+    ///
+    /// Read only by the paired app, by `FirstMeeting`. Optional and defaulted for the same
+    /// reason the ownership fields above are optional: the two apps are built and installed
+    /// separately, and a snapshot from yesterday's build has to stay readable.
+    var restoredSessionSavedAt: Date? = nil
 
     /// Identifies the contents of the heavy fields, so an unchanged one can be left out of
     /// the next broadcast.
@@ -128,7 +136,8 @@ struct StateSnapshot: Codable {
             librarySignature: librarySignature,
             sessionOwnerId: sessionOwnerId,
             sessionClaim: sessionClaim,
-            contextSeed: contextSeed
+            contextSeed: contextSeed,
+            restoredSessionSavedAt: restoredSessionSavedAt
         )
     }
 

@@ -376,6 +376,49 @@ final class FakeRadioFetcher: RadioFetching {
     }
 }
 
+// MARK: - The saved session
+
+/// The disk, as far as `PlayerService` can tell — and the thing two harnesses share to stand
+/// for one app being closed and opened again.
+///
+/// Applies writes as they are asked for, where the real store queues them. What these tests
+/// pin down is *what* gets saved and when it is asked for; the order the queue then keeps is
+/// `PlaybackSessionFileStore`'s business and is tested there.
+@MainActor
+final class FakeSessionStore: PlaybackSessionPersisting {
+    private(set) var session: SavedSession?
+    private(set) var position: SavedPosition?
+    /// Counted, because "nothing was written" is as much a claim worth pinning as what was.
+    private(set) var sessionWrites = 0
+    private(set) var positionWrites: [SavedPosition] = []
+    private(set) var clears = 0
+    private(set) var flushes = 0
+
+    init(session: SavedSession? = nil) {
+        self.session = session
+    }
+
+    func load() -> SavedSession? { session?.overlaying(position) }
+
+    func save(_ session: SavedSession) {
+        self.session = session
+        sessionWrites += 1
+    }
+
+    func savePosition(_ position: SavedPosition) {
+        self.position = position
+        positionWrites.append(position)
+    }
+
+    func clear() {
+        session = nil
+        position = nil
+        clears += 1
+    }
+
+    func flush() { flushes += 1 }
+}
+
 // MARK: - Harness
 
 /// A `PlayerService` wired entirely to fakes, plus the levers needed to simulate the
@@ -400,13 +443,19 @@ final class PlayerHarness {
     /// app's real defaults. Torn down in `deinit`.
     let defaults: UserDefaults
     private let defaultsSuiteName: String
+    /// Where this player keeps its session between launches. Its own by default; hand a second
+    /// harness the first one's to stand for the app being closed and opened again.
+    let sessionStore: FakeSessionStore
 
     /// Commands relayed to a casting browser.
     private(set) var relayedCommands: [String] = []
 
     /// - Parameter storedVolumes: levels already on disk when the app starts, for testing
     ///   what a relaunch restores. Empty means a fresh install.
-    init(storedVolumes: [PlaybackDevice: Double] = [:]) {
+    /// - Parameter sessionStore: what is already saved when the app starts. Empty by default,
+    ///   which is also a fresh install.
+    init(storedVolumes: [PlaybackDevice: Double] = [:], sessionStore: FakeSessionStore = FakeSessionStore()) {
+        self.sessionStore = sessionStore
         defaultsSuiteName = "VVDemusTests-\(UUID().uuidString)"
         defaults = UserDefaults(suiteName: defaultsSuiteName)!
         for (device, level) in storedVolumes {
@@ -422,7 +471,8 @@ final class PlayerHarness {
             sideEffects: sideEffects,
             radios: radios,
             notifications: notifications,
-            defaults: defaults
+            defaults: defaults,
+            sessionStore: sessionStore
         )
         player.onComputerCommand = { [weak self] command in
             switch command {
