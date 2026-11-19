@@ -454,8 +454,10 @@ final class PlayerHarness {
     ///   what a relaunch restores. Empty means a fresh install.
     /// - Parameter sessionStore: what is already saved when the app starts. Empty by default,
     ///   which is also a fresh install.
-    init(storedVolumes: [PlaybackDevice: Double] = [:], sessionStore: FakeSessionStore = FakeSessionStore()) {
-        self.sessionStore = sessionStore
+    init(storedVolumes: [PlaybackDevice: Double] = [:], sessionStore: FakeSessionStore? = nil) {
+        // Built here rather than as the parameter's default: a default value is evaluated
+        // outside the main actor, and the store's initialiser is on it.
+        self.sessionStore = sessionStore ?? FakeSessionStore()
         defaultsSuiteName = "VVDemusTests-\(UUID().uuidString)"
         defaults = UserDefaults(suiteName: defaultsSuiteName)!
         for (device, level) in storedVolumes {
@@ -472,7 +474,7 @@ final class PlayerHarness {
             radios: radios,
             notifications: notifications,
             defaults: defaults,
-            sessionStore: sessionStore
+            sessionStore: self.sessionStore
         )
         player.onComputerCommand = { [weak self] command in
             switch command {

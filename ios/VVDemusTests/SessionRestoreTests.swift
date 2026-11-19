@@ -82,6 +82,9 @@ final class SessionRestoreTests: XCTestCase {
         harness.player.saveSessionNow()
         let sessionWrites = harness.sessionStore.sessionWrites
         let positionWrites = harness.sessionStore.positionWrites.count
+        // So that a save wrongly scheduled by the restore would land inside the wait below
+        // instead of half a second after this test has finished looking.
+        PlayerService.sessionSaveDelay = 0
 
         let relaunched = relaunchAfterBeingKilled()
         await relaunched.drain()
