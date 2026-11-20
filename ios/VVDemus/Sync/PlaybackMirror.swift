@@ -136,6 +136,22 @@ struct FirstMeeting {
         // do provided it is the *same* answer on both, and ids sort oppositely from either side.
         return localPeerId > peerPeerId
     }
+
+    /// Whether this device should drop its session now, rather than wait to be told to.
+    ///
+    /// Ordinarily the loser does nothing: the winner claims, the loser sees the claim on its
+    /// next poll, and letting go follows from that. That depends on the winner knowing it won,
+    /// and a peer on a build from before sessions were saved does not know the clause that
+    /// decided it — it sees a Mac holding a paused queue, applies the desktop rule, and waits
+    /// for the Mac to claim. Nobody claims, the stored ownership record decides instead, and
+    /// if that names this device the peer mirrors it and gives up the queue it was using for
+    /// the one that came back off disk here.
+    ///
+    /// So a restored session that loses is dropped on the spot. The peer then meets an empty
+    /// device, which is what it met before sessions were saved, on any build.
+    var localDropsRestoredSession: Bool {
+        localRestoredAt != nil && !localKeepsSession
+    }
 }
 
 /// What a device holding a session should do on meeting a peer that has none of its own.

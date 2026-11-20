@@ -170,6 +170,42 @@ final class FirstMeetingTests: XCTestCase {
         assertSymmetric(phone)
     }
 
+    /// A restored session that loses is dropped on the spot instead of waiting for the winner
+    /// to claim. A peer on a build from before sessions were saved does not know it won — it
+    /// sees a paused Mac and defers to it — so nobody would claim, and the stored ownership
+    /// record could hand that peer's queue to this one.
+    func testARestoredSessionThatLosesIsDroppedAtOnce() {
+        let macJustOpened = meeting(
+            localPlaying: false, peerPlaying: false, localDesktop: true, peerDesktop: false,
+            localRestoredAt: lastNight
+        )
+        XCTAssertTrue(macJustOpened.localDropsRestoredSession)
+
+        let againstAPeerThatIsPlaying = meeting(
+            localPlaying: false, peerPlaying: true, localDesktop: true, peerDesktop: false,
+            localRestoredAt: lastNight
+        )
+        XCTAssertTrue(againstAPeerThatIsPlaying.localDropsRestoredSession)
+    }
+
+    /// Only a restored one. A session in use that loses still waits to see the winner's claim,
+    /// as it always has — dropping it on the strength of this device's own arithmetic is how
+    /// music would end up nowhere if the two ever disagreed.
+    func testASessionInUseIsNeverDroppedByTheMeetingAlone() {
+        let phonePausedAgainstMacPlaying = meeting(localPlaying: false, peerPlaying: true)
+        XCTAssertFalse(phonePausedAgainstMacPlaying.localKeepsSession)
+        XCTAssertFalse(phonePausedAgainstMacPlaying.localDropsRestoredSession)
+    }
+
+    func testARestoredSessionThatWinsIsKept() {
+        let newerOfTwo = meeting(
+            localPlaying: false, peerPlaying: false, localDesktop: false, peerDesktop: true,
+            localRestoredAt: thisMorning, peerRestoredAt: lastNight
+        )
+        XCTAssertTrue(newerOfTwo.localKeepsSession)
+        XCTAssertFalse(newerOfTwo.localDropsRestoredSession)
+    }
+
     /// The whole table, both ways round. Any clause that ever prefers "me" rather than comparing
     /// the two sides shows up here as both devices keeping the session.
     func testExactlyOneDeviceEverKeepsTheSession() {

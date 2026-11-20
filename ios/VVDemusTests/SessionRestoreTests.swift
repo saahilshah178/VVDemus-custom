@@ -308,6 +308,9 @@ final class SessionRestoreTests: XCTestCase {
 
     func testPausingWritesExactlyWhereItStopped() async {
         await harness.startPlaying(Fixtures.track("a"))
+        // With nothing else waiting to be written, so that what the pause writes is the
+        // position alone — the case for every pause but the first after a track change.
+        harness.player.saveSessionNow()
         harness.engine.tick(to: 5)
         harness.engine.tick(to: 7.5)
         XCTAssertEqual(harness.sessionStore.positionWrites.last?.position ?? -1, 5, accuracy: 0.001,
@@ -317,6 +320,24 @@ final class SessionRestoreTests: XCTestCase {
 
         XCTAssertEqual(harness.sessionStore.positionWrites.last?.position ?? -1, 7.5, accuracy: 0.001)
         XCTAssertEqual(harness.sessionStore.positionWrites.last?.videoId, "a")
+    }
+
+    /// Pause is the last thing a phone in a pocket is told before it may be suspended, and a
+    /// suspended app that is then ended never runs its delayed save. A track that changed a
+    /// moment before the pause must already be written by the time the pause returns.
+    func testPausingWritesAChangeThatWasStillWaiting() async {
+        PlayerService.sessionSaveDelay = 60
+        let list = Fixtures.tracks(["a", "b"])
+        await harness.startPlaying(list[0], context: list)
+        harness.player.advance()
+        await harness.settle { self.harness.player.currentTrack?.videoId == "b" && !self.harness.player.isLoading }
+        harness.engine.tick(to: 3)
+        XCTAssertNil(harness.sessionStore.session, "Precondition: the delayed save has not happened yet")
+
+        harness.player.togglePlayPause()
+
+        XCTAssertEqual(harness.sessionStore.session?.currentTrack.videoId, "b")
+        XCTAssertEqual(harness.sessionStore.session?.position ?? -1, 3, accuracy: 0.001)
     }
 
     func testAScrubIsWrittenAtOnce() async {
@@ -376,15 +397,103 @@ final class SessionRestoreTests: XCTestCase {
     /// prevent.
     func testASessionGivenToThePairedDeviceIsForgottenHere() async {
         await harness.startPlaying(Fixtures.track("a"))
+        // Paused first, as a handoff leaves it: the sender pauses, then waits for the ack.
+        harness.player.togglePlayPause()
         harness.player.saveSessionNow()
         XCTAssertNotNil(harness.sessionStore.session, "Precondition: there is something to forget")
+        // The delayed save must not be what forgets it. Ended inside that delay, the app
+        // would come back holding a session it had just given away.
+        PlayerService.sessionSaveDelay = 60
 
         harness.player.releaseSession()
-        let relaunched = relaunch()
 
         XCTAssertNil(harness.sessionStore.session)
+        let relaunched = relaunchAfterBeingKilled()
         XCTAssertNil(relaunched.player.currentTrack)
         XCTAssertTrue(relaunched.player.contextQueue.isEmpty)
+    }
+
+    /// The position a restored session shows is from before the app last went away. If the
+    /// paired device carried that session on in the meantime, it has already counted those
+    /// seconds — so giving up a session nobody played here credits nothing, which is also
+    /// exactly what happened before sessions were saved.
+    func testGivingUpARestoredSessionNobodyPlayedCreditsNothing() async {
+        await harness.startPlaying(Fixtures.track("a"))
+        harness.engine.tick(to: 40)
+        let relaunched = relaunch()
+
+        relaunched.player.releaseSession()
+
+        XCTAssertNil(relaunched.player.currentTrack)
+        XCTAssertTrue(relaunched.sideEffects.listening.isEmpty)
+    }
+
+    /// Once it has been played here it is an ordinary session, and handing it on credits what
+    /// was heard like any other handoff.
+    func testGivingUpARestoredSessionThatWasPlayedCreditsIt() async {
+        await harness.startPlaying(Fixtures.track("a"))
+        harness.engine.tick(to: 40)
+        let relaunched = relaunch()
+        relaunched.player.togglePlayPause()
+        await relaunched.settle { relaunched.engine.attachCount == 1 && !relaunched.player.isLoading }
+        relaunched.engine.tick(to: 100)
+
+        relaunched.player.releaseSession()
+
+        XCTAssertEqual(relaunched.sideEffects.listening.count, 1)
+        XCTAssertEqual(relaunched.sideEffects.listening.first?.seconds, 100)
+    }
+
+    private func handedOver(_ id: String) -> NowPlayingCheckpoint {
+        NowPlayingCheckpoint(
+            peerId: "the-other-device",
+            isDesktop: true,
+            updatedAt: Date(),
+            currentTrack: Fixtures.track(id),
+            progress: 12,
+            isPlaying: false,
+            manualQueue: [],
+            contextQueue: [],
+            orderedContextQueue: [],
+            isShuffling: false,
+            queueContextTitle: nil,
+            contextSeed: nil
+        )
+    }
+
+    /// A session arriving from the paired device lands on a restored one as it would have
+    /// landed before sessions were saved: on an empty player. Last night's track is not
+    /// where "previous" leads from a queue it was never in, and nothing is credited for it.
+    func testASessionHandedOverReplacesARestoredOneWhole() async {
+        let list = Fixtures.tracks(["a", "b", "c"])
+        await harness.startPlaying(list[0], context: list)
+        harness.player.advance()
+        await harness.settle { self.harness.player.currentTrack?.videoId == "b" && !self.harness.player.isLoading }
+        harness.engine.tick(to: 30)
+        let relaunched = relaunch()
+        XCTAssertTrue(relaunched.player.hasPrevious, "Precondition: the restored session has a history")
+
+        relaunched.player.adopt(checkpoint: handedOver("z"), autoplay: false)
+        await relaunched.settle { relaunched.player.currentTrack?.videoId == "z" && !relaunched.player.isLoading }
+
+        XCTAssertFalse(relaunched.player.hasPrevious)
+        XCTAssertTrue(relaunched.player.contextQueue.isEmpty)
+        XCTAssertTrue(relaunched.sideEffects.listening.isEmpty)
+        XCTAssertEqual(relaunched.engine.currentTimeSeconds, 12, accuracy: 0.001)
+    }
+
+    /// The same handoff onto a session somebody *was* using here is unchanged: the track it
+    /// replaces is credited and is where "previous" leads.
+    func testASessionHandedOverOntoOneInUseStillLeadsBackToIt() async {
+        await harness.startPlaying(Fixtures.track("a"))
+        harness.engine.tick(to: 30)
+
+        harness.player.adopt(checkpoint: handedOver("z"), autoplay: false)
+        await harness.settle { self.harness.player.currentTrack?.videoId == "z" && !self.harness.player.isLoading }
+
+        XCTAssertTrue(harness.player.hasPrevious)
+        XCTAssertEqual(harness.sideEffects.listening.first?.track.videoId, "a")
+        XCTAssertEqual(harness.sideEffects.listening.first?.seconds, 30)
     }
 
     // MARK: - Only filling the blank

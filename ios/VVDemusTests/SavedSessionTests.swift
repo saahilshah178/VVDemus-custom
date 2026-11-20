@@ -246,6 +246,25 @@ final class SavedSessionTests: XCTestCase {
         XCTAssertEqual(nextLaunch.load()?.manualQueue.map(\.videoId), ["m1"])
     }
 
+    // MARK: - Keeping the tests out of the real session
+
+    func testAnAppHostingItsOwnTestsIsRecognisedFromItsEnvironment() {
+        for key in ["XCTestConfigurationFilePath", "XCTestBundlePath", "XCTestSessionIdentifier"] {
+            XCTAssertTrue(PlaybackSessionFileStore.isHostingUnitTests(environment: [key: "anything"]), key)
+        }
+        XCTAssertFalse(PlaybackSessionFileStore.isHostingUnitTests(environment: ["PATH": "/usr/bin"]))
+        XCTAssertFalse(PlaybackSessionFileStore.isHostingUnitTests(environment: [:]))
+    }
+
+    /// This process is that app: the suite is hosted, so `PlayerService.shared` here is the
+    /// real one, in the real container. If this fails, Xcode has stopped setting the
+    /// variables above — and every run of the suite is then starting from whatever this
+    /// simulator's app last played, and leaving its fixtures behind as the saved session.
+    func testThisTestRunKeepsOutOfTheRealSavedSession() {
+        XCTAssertTrue(PlaybackSessionFileStore.isHostingUnitTests())
+        XCTAssertTrue(PlaybackSessionFileStore.forRunningApp is NoSessionPersistence)
+    }
+
     /// The directory does not exist on a first launch, and the first save must not be the
     /// thing that discovers that.
     func testTheStoreCreatesItsDirectory() {

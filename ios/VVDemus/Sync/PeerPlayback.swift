@@ -301,6 +301,10 @@ final class PeerPlayback: ObservableObject, SessionOwning {
 
         PairLog.info("first meeting with \(peer.name): local playing=\(meeting.localIsPlaying) desktop=\(localIsDesktop), peer playing=\(state.isPlaying) — \(meeting.localKeepsSession ? "keeping the session here" : "yielding to the peer")")
         if meeting.localKeepsSession { SessionOwnership.shared.claimLocally() }
+        if meeting.localDropsRestoredSession {
+            PairLog.info("the session here only came back off disk — letting it go rather than contest \(peer.name)'s")
+            PlayerService.shared.releaseSession()
+        }
     }
 
     private func apply(_ state: StateSnapshot, from peer: PairedPeer) {

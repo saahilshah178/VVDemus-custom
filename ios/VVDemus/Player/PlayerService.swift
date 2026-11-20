@@ -21,7 +21,9 @@ final class PlayerService: ObservableObject {
     @Published private(set) var isPlaying = false {
         // Stopping is the moment the position stops moving, so it is the moment to write
         // down exactly where — not wherever the last five-second mark happened to fall.
-        didSet { if oldValue, !isPlaying { savePositionIfMoved() } }
+        // And the moment after which a phone in a pocket may be suspended: a track that
+        // changed half a second before the pause must not still be waiting to be written.
+        didSet { if oldValue, !isPlaying { savePendingChanges() } }
     }
     @Published private(set) var isLoading = false
     @Published private(set) var progress: Double = 0 { didSet { positionDidChange() } }
@@ -293,7 +295,7 @@ final class PlayerService: ObservableObject {
             notifications: .default,
             sessionOwner: PeerPlayback.shared,
             mirror: PeerMirroredNowPlaying.shared,
-            sessionStore: PlaybackSessionFileStore.shared
+            sessionStore: PlaybackSessionFileStore.forRunningApp
         )
     }
 
@@ -793,7 +795,13 @@ final class PlayerService: ObservableObject {
             // playing should not begin blasting music; the user's tap does that. What it
             // must do is make sure the session is live on the new route, so the first tap
             // afterwards works immediately.
-            guard activeDevice == .iphone, currentTrack != nil else { return }
+            //
+            // Only once something of this track has reached the engine. A session read back
+            // off disk at launch has a track and nothing attached, and activating for it would
+            // take the route from whatever else is playing — a podcast in another app stopping
+            // because AirPods were connected while this one happened to be open. The press
+            // that does start it activates the session itself, in `attach`.
+            guard activeDevice == .iphone, currentTrack != nil, attachedURL != nil else { return }
             session.activate(casting: false)
         case .categoryChange, .override, .routeConfigurationChange:
             // Another app (or our own casting switch) reshaped the route. Only worth
@@ -982,6 +990,10 @@ final class PlayerService: ObservableObject {
     /// "continue from…" prompt.
     func adopt(checkpoint: NowPlayingCheckpoint, autoplay: Bool) {
         guard let track = checkpoint.currentTrack else { return }
+        // Onto a device that was holding nothing but what it read back off disk, this arrives
+        // as it would have before sessions were saved: onto an empty player. Otherwise last
+        // night's track becomes where "previous" leads from a queue it was never part of.
+        forgetUntouchedRestoredSession()
         if let seed = checkpoint.contextSeed { sideEffects.recordRadioSeed(seed) }
         currentContextSeed = checkpoint.contextSeed
         manualQueue = checkpoint.manualQueue
@@ -1011,7 +1023,11 @@ final class PlayerService: ObservableObject {
         // Before the track is forgotten. Stats are otherwise credited when one track replaces
         // another, and the track handed to the other device is never replaced here — so the
         // seconds listened to before the handoff would simply vanish.
-        recordListeningStats()
+        //
+        // Not for a session that only came back off disk and was never played here. Its
+        // position is from before the app last went away, and if the paired device carried
+        // that session on in the meantime it has already counted those seconds as its own.
+        if restoredSessionSavedAt == nil { recordListeningStats() }
         PairLog.info("releasing the session: \(currentTrack?.title ?? "nothing") at \(String(format: "%.1f", progress))s")
         bumpPlaybackEpoch()
         loadTask?.cancel()
@@ -1066,6 +1082,9 @@ final class PlayerService: ObservableObject {
         // Falls back to `clear()` on its own when there is no mirrored session either, which is
         // every case that isn't a handoff.
         updateNowPlayingInfo()
+        // Forgotten on disk now rather than after the usual delay. Ended inside that delay,
+        // the app would come back holding a session it had just given away.
+        savePendingChanges()
     }
 
     // MARK: - Remembering the session between launches
@@ -1137,6 +1156,18 @@ final class PlayerService: ObservableObject {
         restoredSessionSavedAt = Date(timeIntervalSince1970: saved.savedAt.timeIntervalSince1970.rounded(.down))
         lastWrittenPosition = (saved.currentTrack.videoId, position)
         updateNowPlayingInfo()
+    }
+
+    /// Drops a session that only came back off disk and has not been used, leaving this
+    /// device as empty as it would have launched before sessions were saved. Does nothing to
+    /// a session anyone has touched.
+    private func forgetUntouchedRestoredSession() {
+        guard restoredSessionSavedAt != nil else { return }
+        // The track first: with none, the load that follows has nothing to credit to the
+        // listening stats and nothing to push onto the back stack.
+        currentTrack = nil
+        backStack = []
+        progress = 0
     }
 
     /// Something about which tracks are queued, or which one is playing, has changed.
@@ -1218,12 +1249,18 @@ final class PlayerService: ObservableObject {
     /// instant it stops being: a track skipped to just before quitting, or the last few seconds
     /// of listening, would come back as they were a moment earlier.
     func saveSessionNow() {
+        savePendingChanges()
+        sessionStore.flush()
+    }
+
+    /// Hands over anything not yet written, without waiting for it to reach the disk.
+    private func savePendingChanges() {
         if pendingSessionSave != nil {
+            // The whole session, which carries the position with it.
             saveSession()
         } else {
             savePositionIfMoved()
         }
-        sessionStore.flush()
     }
 
     private func observeLastChancesToSave() {
@@ -1494,9 +1531,10 @@ final class PlayerService: ObservableObject {
         // picks the session up where it was left.
         if shouldPlay, attachedURL == nil, !isLoading, let track = currentTrack {
             // Carried across the reload, since it is either where the session was saved or a
-            // scrub made since — a position the user chose both ways. Zeroed first because none
-            // of it was heard in this run, and `beginLoad` would otherwise credit it to the
-            // listening stats.
+            // scrub made since — a position the user chose both ways. Zeroed first because
+            // `beginLoad` credits whatever `progress` says to the listening stats, as it would
+            // for a track being left — and this track is not being left. Its seconds are
+            // credited once, when it finally is; here as well would be twice.
             let resumeAt = progress
             progress = 0
             beginLoad(track, startAt: resumeAt)
